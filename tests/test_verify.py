@@ -220,6 +220,24 @@ def test_checks_truthy_catches_empty():
     assert checks.not_(checks.truthy())(0, {}) is True
 
 
+def test_checks_min_length_contains_matches_inrange():
+    # min_length: evidence must be real proof, not a one-liner
+    assert checks.min_length(100, key="evidence")({"evidence": "x" * 120}, {}) is True
+    assert checks.min_length(100, key="evidence")({"evidence": "too short"}, {}) is False
+    # contains: proof must mention the host
+    assert checks.contains("acme.com", key="evidence")({"evidence": "hit api.acme.com"}, {}) is True
+    assert checks.contains("acme.com", key="evidence")({"evidence": "generic claim"}, {}) is False
+    # matches: evidence contains a URL
+    assert checks.matches(r"https?://", key="e")({"e": "see https://x.com/1"}, {}) is True
+    assert checks.matches(r"https?://", key="e")({"e": "no url here"}, {}) is False
+    # in_range: scores within spec
+    assert checks.in_range(1, 10, key="grammar")({"grammar": 8}, {}) is True
+    assert checks.in_range(1, 10, key="grammar")({"grammar": 0}, {}) is False
+    # graceful on wrong types
+    assert checks.min_length(5)(None, {}) is False
+    assert checks.in_range(1, 10)("notanumber", {}) is False
+
+
 def test_checks_file_exists(tmp_path):
     p = tmp_path / "report.txt"
     pc = checks.file_exists(str(p))

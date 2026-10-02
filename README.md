@@ -97,7 +97,8 @@ the discrepancy back to the agent. Detection *and* correction, in one decorator.
 
 ```python
 from nabit import verify
-from nabit.checks import all_of, has_keys, field_equals, file_fresh, http_ok, truthy
+from nabit.checks import (all_of, has_keys, field_equals, file_fresh, http_ok,
+                         truthy, min_length, contains, matches, in_range)
 
 @verify(all_of(has_keys("id", "status"), field_equals("status", "created")))
 def create(...): ...
@@ -110,7 +111,18 @@ def deploy(): ...
 
 @verify(truthy())                                           # not [] / "" / None
 def search(...): ...
+
+# an agent's "reportable" finding must carry real proof, not a one-line claim
+@verify(all_of(min_length(100, key="evidence"), matches(r"https?://", key="evidence")))
+def finish_task(finding): ...
+
+@verify(in_range(1, 10, key="score"))                       # LLM judge score in spec
+def judge(...): ...
 ```
+
+Full check list: `all_of` / `any_of` / `not_`, `has_keys`, `equals`,
+`field_equals`, `truthy`, `non_empty`, `min_length`, `contains`, `matches`,
+`in_range`, `file_exists`, `file_fresh`, `http_ok`, `predicate`.
 
 ### Group verifications under a run id
 

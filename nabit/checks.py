@@ -89,6 +89,66 @@ def non_empty() -> PostCondition:
     return _pc
 
 
+def _pluck(result: Any, key: Optional[str]) -> Any:
+    """Get result[key] if key given and result is a mapping/attr, else result."""
+    if key is None:
+        return result
+    if isinstance(result, Mapping):
+        return result.get(key)
+    return getattr(result, key, None)
+
+
+def min_length(n: int, key: Optional[str] = None) -> PostCondition:
+    """Result (or result[key]) has len >= n. Catches the 'evidence is just a
+    URL' / truncated-output silent failure (e.g. an agent's finding must carry
+    >100 chars of real proof, not a one-line claim)."""
+    def _pc(result: Any, ctx: dict) -> bool:
+        val = _pluck(result, key)
+        try:
+            return len(val) >= n
+        except TypeError:
+            return False
+    return _pc
+
+
+def contains(needle: Any, key: Optional[str] = None) -> PostCondition:
+    """`needle` is contained in result (or result[key]). Works for substrings,
+    list membership, dict keys — anything supporting `in`. Catches 'the proof
+    doesn't actually mention the target host' style lies."""
+    def _pc(result: Any, ctx: dict) -> bool:
+        val = _pluck(result, key)
+        try:
+            return needle in val
+        except TypeError:
+            return False
+    return _pc
+
+
+def matches(pattern: str, key: Optional[str] = None) -> PostCondition:
+    """A regex search succeeds against result (or result[key]), coerced to str.
+    Use for 'evidence must contain a hostname / HTTP status / timestamp'."""
+    import re
+
+    rx = re.compile(pattern)
+
+    def _pc(result: Any, ctx: dict) -> bool:
+        val = _pluck(result, key)
+        return val is not None and bool(rx.search(str(val)))
+    return _pc
+
+
+def in_range(lo: float, hi: float, key: Optional[str] = None) -> PostCondition:
+    """Numeric result (or result[key]) is within [lo, hi]. Catches values that
+    are out of spec (e.g. an LLM judge returning 0s but marking 'passed')."""
+    def _pc(result: Any, ctx: dict) -> bool:
+        val = _pluck(result, key)
+        try:
+            return lo <= val <= hi
+        except TypeError:
+            return False
+    return _pc
+
+
 # --- real-world side-effect checks (the whole point of nabit) ----------------
 def file_exists(path_or_fn: str | Callable[[Any, dict], str]) -> PostCondition:
     """A file exists on disk. `path_or_fn` is a literal path or a callable
