@@ -29,13 +29,14 @@ _RECORD_KEYS = ("name", "passed", "duration_ms", "result", "error",
                 "attempts", "run_id", "timestamp")
 
 
-def load_records(paths: Iterable[str], max_records: int = DEFAULT_MAX_RECORDS) -> list[dict]:
+def load_records(paths: Iterable[str], max_records: int = DEFAULT_MAX_RECORDS,
+                 sources: Optional[dict] = None) -> list[dict]:
     """Load JSONL sink files into dashboard records. Bad lines are skipped;
-    each record gains `_source` from its file stem so merged files are
-    distinguishable in the UI."""
+    each record gains `_source` (from `sources` when given, else the file
+    stem) so merged files are distinguishable in the UI."""
     records: list[dict] = []
     for path in paths:
-        source = Path(path).stem
+        source = (sources or {}).get(path) or Path(path).stem
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -79,15 +80,50 @@ def aggregate(records: list[dict]) -> list[dict]:
     return rows
 
 
+def load_history(history_dir: str | Path) -> list[dict]:
+    """Read the compact history lines (one per scheduled run) that
+    nabit.runner.run_audit appends to <dir>/history.jsonl. Each line gains
+    `_source` from the dir name so multiple audit dirs merge cleanly."""
+    path = Path(history_dir) / "history.jsonl"
+    lines: list[dict] = []
+    if not path.exists():
+        return lines
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict):
+                d["_source"] = Path(history_dir).stem
+                lines.append(d)
+    return lines
+
+
+def _latest_run_file(history_dir: str | Path) -> Optional[str]:
+    """The most recent full-results file in a history dir (not history.jsonl)."""
+    files = sorted(
+        p for p in Path(history_dir).glob("*.jsonl") if p.name != "history.jsonl"
+    )
+    return str(files[-1]) if files else None
+
+
 def build_html(records: list[dict], title: str = "nabit — verification dashboard",
-               generated: Optional[str] = None) -> str:
+               generated: Optional[str] = None,
+               history: Optional[list[dict]] = None) -> str:
     """Render the self-contained dashboard. All dynamic behavior (search,
-    filters, drill-down) is vanilla JS over the embedded records."""
+    filters, drill-down) is vanilla JS over the embedded records. When
+    `history` (compact per-run aggregates from run_audit) is present the
+    dashboard adds a trend section; drill-down then covers the latest run."""
     data = {
         "title": title,
         "generated": generated or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "records": records,
         "aggregate": aggregate(records),
+        "history": history or [],
     }
     payload = json.dumps(data, default=str).replace("</", "<\\/")  # </script> safety
     return _TEMPLATE.replace("__DATA__", payload).replace("__TITLE__", _escape(title))
@@ -99,10 +135,25 @@ def _escape(s: str) -> str:
 
 def write_dashboard(paths: list[str], out: str, title: str = "nabit — verification dashboard",
                     max_records: int = DEFAULT_MAX_RECORDS) -> str:
-    records = load_records(paths, max_records)
-    if not records:
+    """Build the dashboard from JSONL files and/or history directories (as
+    produced by `python -m nabit run`). A directory adds the trend view and
+    contributes its latest run's records for drill-down."""
+    files: list[str] = []
+    history: list[dict] = []
+    sources: dict = {}
+    for p in paths:
+        if Path(p).is_dir():
+            history.extend(load_history(p))
+            latest = _latest_run_file(p)
+            if latest:
+                files.append(latest)
+                sources[latest] = Path(p).stem  # label by audit, not timestamp
+        else:
+            files.append(p)
+    records = load_records(files, max_records, sources=sources)
+    if not records and not history:
         raise SystemExit("no verification records found in: %s" % ", ".join(paths))
-    html = build_html(records, title=title)
+    html = build_html(records, title=title, history=history)
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)
     return out
@@ -187,6 +238,13 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <h1><span class="g">nabit</span> // verification dashboard</h1>
   <div class="sub" id="meta"></div>
   <div class="cards" id="cards"></div>
+
+  <div id="historywrap" style="display:none">
+    <div class="section"><span class="g">$</span> history — scheduled runs over time <span id="histmeta"></span></div>
+    <table><thead><tr>
+      <th>check</th><th>source</th><th>runs</th><th>latest</th><th>prev</th><th>trend</th><th>failures/run</th>
+    </tr></thead><tbody id="histbody"></tbody></table>
+  </div>
 
   <div class="section"><span class="g">$</span> verifications by check <span id="aggcount"></span></div>
   <div class="filters" style="margin-bottom:10px">
@@ -364,7 +422,57 @@ $('#expandall').addEventListener('click', () =>
 $('#collapseall').addEventListener('click', () =>
   document.querySelectorAll('#fails details.fgroup').forEach(d => d.open = false));
 
+// --- history / trend section (populated only when scheduled runs exist) ------
+function spark(vals, w = 130, h = 22) {
+  const max = Math.max(...vals, 1);
+  const bw = w / Math.max(vals.length, 1);
+  const bars = vals.map((v, i) => {
+    const bh = v > 0 ? Math.max(v / max * h, 2) : 1.5;
+    return `<rect x="${(i * bw).toFixed(1)}" y="${(h - bh).toFixed(1)}" width="${Math.max(bw - 1.5, 1).toFixed(1)}" height="${bh.toFixed(1)}" fill="${v > 0 ? 'var(--danger)' : 'var(--accent)'}" opacity="0.85" rx="1"/>`;
+  }).join('');
+  return `<svg width="${w}" height="${h}" style="vertical-align:middle">${bars}</svg>`;
+}
+
+function renderHistory() {
+  const H = DATA.history || [];
+  if (!H.length) return;
+  $('#historywrap').style.display = '';
+  // per (source, check) series across runs, ordered by time
+  const per = {};
+  for (const h of H) {
+    for (const [n, c] of Object.entries(h.checks || {})) {
+      const k = h._source + ' ' + n;
+      (per[k] || (per[k] = { source: h._source, name: n, runs: [] })).runs.push(
+        { ts: +h.ts || 0, ts_str: h.ts_str, failed: c.failed, total: c.total });
+    }
+  }
+  const rows = Object.values(per);
+  for (const r of rows) r.runs.sort((a, b) => a.ts - b.ts);
+  rows.sort((a, b) => b.runs.length - a.runs.length || a.name.localeCompare(b.name));
+  $('#histmeta').textContent = `(${H.length} run${H.length===1?'':'s'} — drill-down below shows the latest)`;
+  $('#histbody').innerHTML = rows.map(r => {
+    const last = r.runs[r.runs.length - 1];
+    const prev = r.runs.length > 1 ? r.runs[r.runs.length - 2] : null;
+    let delta;
+    if (!prev) delta = '<span style="color:var(--dim)">first run</span>';
+    else if (last.failed > prev.failed) delta = `<span class="fail">▲ +${last.failed - prev.failed}</span>`;
+    else if (last.failed < prev.failed) delta = `<span class="pass">▼ ${last.failed - prev.failed}</span>`;
+    else delta = '<span style="color:var(--dim)">— same</span>';
+    const vals = r.runs.map(x => x.failed);
+    return `<tr>
+      <td><span class="nm">${esc(r.name)}</span></td>
+      <td><span class="src">${esc(r.source)}</span></td>
+      <td>${r.runs.length}</td>
+      <td class="${last.failed ? 'fail' : 'pass'}">${last.failed}/${last.total}</td>
+      <td>${prev ? prev.failed : '—'}</td>
+      <td>${delta}</td>
+      <td>${spark(vals)}</td>
+    </tr>`;
+  }).join('');
+}
+
 render();
+renderHistory();
 </script>
 </body>
 </html>
@@ -389,9 +497,53 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_rep = sub.add_parser("report", help="print a terminal pass/fail table from a JSONL sink file")
     p_rep.add_argument("file", help="JSONL sink file")
 
+    p_run = sub.add_parser("run", help="run a registered audit and record history (cron-friendly)")
+    p_run.add_argument("name", nargs="?", help="audit name (as defined by @nabit.audit)")
+    p_run.add_argument("--all", action="store_true", help="run every audit in the audits file")
+    p_run.add_argument("--audits", default=None,
+                       help="path to the audits module (default: $NABIT_AUDITS or ./nabit_audits.py)")
+    p_run.add_argument("--out", default="nabit-history", help="history directory (default: nabit-history/)")
+    p_run.add_argument("--strict", action="store_true", help="exit 1 if any check failed")
+
+    p_ls = sub.add_parser("audits", help="list audits defined in an audits module")
+    p_ls.add_argument("--audits", default=None)
+
     args = parser.parse_args(argv)
     if args.cmd == "report":
         print(report_from_jsonl(args.file))
+        return
+
+    if args.cmd in ("run", "audits"):
+        import os as _os
+
+        audits_path = (args.audits if getattr(args, "audits", None)
+                       else _os.environ.get("NABIT_AUDITS") or "nabit_audits.py")
+        from .runner import load_audits, run_audit
+
+        audits = load_audits(audits_path)
+        if args.cmd == "audits":
+            for n in sorted(audits):
+                print(n, "-", (audits[n].__doc__ or "").strip().splitlines()[0]
+                      if audits[n].__doc__ else "")
+            if not audits:
+                print("no @nabit.audit functions found in", audits_path)
+            return
+        names = sorted(audits) if args.all else [args.name]
+        if not args.all and not args.name:
+            parser.error("run needs an audit name (or --all)")
+        any_failed = 0
+        for n in names:
+            if n not in audits:
+                parser.error(f"unknown audit {n!r}; available: {', '.join(sorted(audits)) or 'none'}")
+            res = run_audit(audits[n], history_dir=args.out)
+            print(f"== {n}: {res['passed']}/{res['total']} passed, "
+                  f"{res['failed']} failed ({res['duration_s']}s) -> {res['run_file']}")
+            from .report import report_from_jsonl as _rfj
+
+            print(_rfj(res["run_file"]))
+            any_failed += res["failed"]
+        if args.strict and any_failed:
+            sys.exit(1)
         return
 
     out = write_dashboard(args.files, args.out, title=args.title,

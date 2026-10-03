@@ -69,6 +69,48 @@ filters, and expandable drill-downs showing each lying claim's payload and
 error. This is the tool that was used to browse a 29k-verification production
 audit across two systems (a content pipeline and a recon platform).
 
+## Scheduling: define audits once, run them forever
+
+Wrap your checks in an audit module:
+
+```python
+# nabit_audits.py
+from nabit import audit, check_claims
+
+@audit
+def captions_daily():
+    """every claim the captions pipeline makes, against real state"""
+    check_claims(lambda r, ctx: r["video_id"] in caption_ok,
+                 rows(), name="caption_extracted -> caption row non-empty")
+    check_claims(lambda r, ctx: os.path.exists(r["storage_path"]),
+                 path_rows(), name="downloaded -> file exists on disk")
+```
+
+List and run them from the CLI (cron/systemd does the scheduling — nabit
+stays a library, not a daemon):
+
+```bash
+python -m nabit audits                                        # list what's defined
+python -m nabit run captions_daily --out /data/nabit-history
+python -m nabit run --all --audits nabit_audits.py --strict   # exit 1 on any failure
+```
+
+Every run writes a timestamped JSONL (full results) plus one compact line to
+`history.jsonl`. Point the dashboard at the history directory and it becomes
+a **trend dashboard**: per-check sparklines across runs, run-over-run delta
+arrows (▲ getting worse / ▼ better), and drill-down into the latest run's
+failures:
+
+```bash
+python -m nabit dashboard /data/nabit-history
+```
+
+A crontab line is all the infrastructure you need:
+
+```
+15 7 * * * cd /srv/app && python -m nabit run captions_daily --out /data/nabit-history --strict
+```
+
 ## Usage
 
 ### Post-conditions check reality, not the agent's word
