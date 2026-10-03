@@ -199,6 +199,101 @@ def _record(result: VerificationResult) -> None:
             logger.exception("nabit: sink raised; continuing")
 
 
+# --- bulk verification (the retro-audit pattern) ------------------------------
+@dataclass
+class BulkSummary:
+    """Aggregate outcome of a nabit.check_claims() batch."""
+
+    total: int
+    passed: int
+    failed: int
+    failed_results: list  # VerificationResult for each failure
+    duration_ms: float
+
+    def __str__(self) -> str:  # readable at a glance in logs
+        return (f"check_claims: {self.passed}/{self.total} passed, "
+                f"{self.failed} failed ({self.duration_ms:.0f}ms)")
+
+
+def check_claims(
+    check: PostCondition,
+    claims: Any,
+    *,
+    name: str = "claim",
+    mode: Union[Mode, str] = Mode.SILENT,
+) -> BulkSummary:
+    """Verify a batch of claims against real state — the retro-audit pattern.
+
+    Instead of decorating one function and looping, hand check_claims() the
+    check and an iterable of claims; each gets recorded like any verification
+    (counters, run ids, sinks all apply). Works inside `with run(...)`.
+
+    Each claim is either a bare value or a (result, ctx) pair:
+
+        caption_ok = {ids with a real caption row}
+        rows = db.execute("select id from videos where processing_status='caption_extracted'")
+
+        s = check_claims(
+            lambda r, ctx: r["video_id"] in caption_ok,
+            ({"video_id": r[0]} for r in rows),      # bare dicts: ctx = result
+            name="caption_extracted",
+        )
+        print(s)                    # check_claims: 14232/14232 passed, 0 failed
+        print(s.failed_results[:5]) # first 5 liars, each with its result
+
+    For a bare claim that is a dict, ctx is the claim itself; wrap claims as
+    (result, ctx) pairs when the check needs inputs separate from outputs.
+
+    mode applies to the batch as a whole: SILENT (default), LOG, WARN — one
+    summary line, not one per row — or RAISE, which raises VerificationError
+    after the loop if anything failed.
+    """
+    mode = Mode(mode)
+    start = time.perf_counter()
+    total = 0
+    passed = 0
+    failed_results: list[VerificationResult] = []
+
+    for item in claims:
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], dict):
+            result, ctx = item
+        elif isinstance(item, dict):
+            result, ctx = item, item
+        else:
+            result, ctx = item, {}
+        total += 1
+        try:
+            ok = bool(check(result, ctx))
+            err = None
+        except Exception as exc:  # noqa: BLE001 — a broken check is a failed claim
+            ok, err = False, f"check raised: {exc}"
+        passed += int(ok)
+        vr = VerificationResult(
+            name=name, passed=ok, duration_ms=0.0, result=result,
+            error=err, attempts=1, run_id=_current_run.get(),
+        )
+        _record(vr)
+        if not ok:
+            failed_results.append(vr)
+
+    summary_ = BulkSummary(
+        total=total, passed=passed, failed=total - passed,
+        failed_results=failed_results,
+        duration_ms=(time.perf_counter() - start) * 1000,
+    )
+
+    if summary_.failed:
+        msg = (f"nabit: {name} — {summary_.failed}/{total} claims FAILED "
+               f"verification against real state")
+        if mode is Mode.RAISE:
+            raise VerificationError(msg)
+        if mode is Mode.WARN:
+            logger.warning(msg)
+        elif mode is Mode.LOG:
+            logger.info(msg)
+    return summary_
+
+
 # A post-condition receives (result, context) and returns a truthy value for
 # "reality matches the claim". `context` is the bound call arguments, so you
 # can check the inputs against the outputs. May be sync or async.

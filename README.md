@@ -202,12 +202,78 @@ async def create_order(cart):
 ### Inspect what happened
 
 ```python
-from nabit import get_results
+from nabit import get_results, summary, failures, report
 
 for r in get_results():
     print(r.name, "PASS" if r.passed else "FAIL",
           f"{r.duration_ms:.0f}ms", f"attempts={r.attempts}", r.error)
+
+print(summary())        # exact totals, even beyond the in-memory ring buffer
+print(failures())       # just the liars
+print(report())         # formatted pass/fail table:
+
+# verification             total     pass      FAIL     rate   avg ms
+# --------------------------------------------------------------------
+# caption_extracted       14232    14232         0  100.0%     0.0
+# storage_path_exists      3000      2997         3   99.9%     0.0
+# --------------------------------------------------------------------
+# TOTAL                   17232    17229         3   99.9%     0.0
 ```
+
+### Retro-audits: verify claims in bulk
+
+Retro-audit real data ("does every row that claims X actually have X?") with
+`check_claims` — no decorator-per-function ceremony:
+
+```python
+from nabit import check_claims, run, add_sink, jsonl_sink, report_from_jsonl
+
+add_sink(jsonl_sink("audit.jsonl"))          # stream every result to disk
+caption_ok = {ids with a real caption row}
+
+with run("audit-2026-10"):
+    s = check_claims(
+        lambda r, ctx: r["video_id"] in caption_ok,
+        ({"video_id": row[0]} for row in db.execute("select id from videos ...")),
+        name="caption_extracted",
+    )
+
+print(s)                                     # check_claims: 14232/14232 passed, 0 failed
+print(s.failed_results[:5])                  # the liars, each with its claim
+print(report_from_jsonl("audit.jsonl"))      # exact table from the sink file
+```
+
+Each claim is a bare value (for dicts, ctx = the claim itself) or a
+`(result, ctx)` pair. This pattern was used to retro-audit a live 24k-row
+production database in under a second.
+
+### Celery: run ids across the process boundary
+
+A Celery task runs in a different *process* than the code that queued it, so
+`run()` contextvars don't survive `.delay()`. The optional celery extra
+propagates run ids through message headers:
+
+```bash
+pip install nabit[celery]
+```
+
+```python
+from nabit.contrib.celery import install
+install()                       # once, at startup (idempotent)
+
+# publisher side — unchanged usage:
+with run("signup-123"):
+    process.delay(user_id)      # run id rides the message headers
+
+# worker side — verifications inside the task carry run "signup-123":
+@app.task
+def process(user_id):
+    do_work(user_id)            # @verify results inherit the run id
+    return summary()            # scoped to this task's run
+```
+
+Core nabit stays zero-dependency; celery is only imported if you import
+`nabit.contrib.celery`.
 
 ### Also catches "it threw but the side effect still happened"
 

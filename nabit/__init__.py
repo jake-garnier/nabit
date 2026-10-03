@@ -28,6 +28,8 @@ from .core import (
     run,
     summary,
     failures,
+    check_claims,
+    BulkSummary,
     VerificationError,
     VerificationResult,
     get_results,
@@ -37,6 +39,7 @@ from .core import (
     Mode,
 )
 from .sinks import jsonl_sink
+from .report import report, report_from_jsonl
 
 from . import checks
 
@@ -45,6 +48,8 @@ __all__ = [
     "run",
     "summary",
     "failures",
+    "check_claims",
+    "BulkSummary",
     "VerificationError",
     "VerificationResult",
     "get_results",
@@ -52,8 +57,10 @@ __all__ = [
     "add_sink",
     "clear_sinks",
     "jsonl_sink",
+    "report",
+    "report_from_jsonl",
     "checks",
     "Mode",
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
