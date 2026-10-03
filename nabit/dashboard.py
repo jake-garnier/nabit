@@ -288,7 +288,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
     <th>check</th><th>source</th><th>total</th><th>pass</th><th>FAIL</th><th>rate</th><th>pass/fail</th><th>avg ms</th>
   </tr></thead><tbody></tbody></table>
 
-  <div class="section"><span class="g">$</span> failures — claims that lied <span id="failcount"></span>
+  <div class="section"><span class="g">$</span> <span id="failhdr">failures — claims that lied</span> <span id="failcount"></span>
     <button class="mini" id="expandall" style="margin-left:8px">expand all</button>
     <button class="mini" id="collapseall">collapse all</button>
   </div>
@@ -369,9 +369,12 @@ function render() {
     </tr>`;
   }).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--dim)">no matches</td></tr>`;
 
-  // failures drill-down — grouped by error signature so thousands of the
-  // same failure collapse into one expandable, paginated group
-  const fails = rows.filter(r => !r.passed);
+  // records drill-down — grouped by error signature so thousands of the
+  // same failure collapse into one expandable, paginated group.
+  // status filter 'pass' flips this into a browser for claims that held up.
+  const showingPasses = state.status === 'pass';
+  $('#failhdr').textContent = showingPasses ? 'records — claims that held up' : 'failures — claims that lied';
+  const fails = showingPasses ? rows.filter(r => r.passed) : rows.filter(r => !r.passed);
   G = {};
   const groups = [];
   for (const r of fails) {
@@ -380,7 +383,7 @@ function render() {
       String(r.error || '(no error message)').replace(/\d+/g, 'N');
     let g = G[sig];
     if (!g) { g = G[sig] = { sig, name: r.name || 'unknown',
-      label: String(r.error || '(no error message)').replace(/\d+/g, 'N'),
+      label: String(r.error || r.name || 'unknown').replace(/\d+/g, 'N'),
       items: [] }; groups.push(g); }
     g.items.push(r);
   }
@@ -399,7 +402,7 @@ function render() {
       </summary>
       <div class="groupbody">${buildBody(g)}</div>
     </details>`;
-  }).join('') || '<div class="section" style="color:var(--dim)">nothing failed. suspicious — widen the filters?</div>';
+  }).join('') || `<div class="section" style="color:var(--dim)">${showingPasses ? 'no records match' : 'nothing failed. suspicious — widen the filters?'}</div>`;
 }
 
 function failCard(r) {
