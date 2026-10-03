@@ -27,6 +27,7 @@ from .core import (
     verify,
     run,
     summary,
+    failures,
     VerificationError,
     VerificationResult,
     get_results,
@@ -43,6 +44,7 @@ __all__ = [
     "verify",
     "run",
     "summary",
+    "failures",
     "VerificationError",
     "VerificationResult",
     "get_results",
@@ -54,4 +56,4 @@ __all__ = [
     "Mode",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"

@@ -3,7 +3,7 @@ import logging
 import pytest
 
 from nabit import (
-    verify, run, summary, Mode, VerificationError,
+    verify, run, summary, failures, Mode, VerificationError,
     get_results, clear_results, add_sink, clear_sinks,
 )
 from nabit import checks
@@ -278,3 +278,49 @@ async def test_async_retries():
 
     assert await f() == 2
     assert get_results()[0].attempts == 2
+
+
+# --- exact summary beyond the ring buffer (found in production audit) --------
+def test_summary_exact_beyond_ring_buffer():
+    # 1200 verifications > _MAX_RESULTS(1000): summary must count all, not the ring
+    @verify(lambda result, ctx: True, mode=Mode.SILENT)
+    def ok():
+        return 1
+
+    for _ in range(1200):
+        ok()
+    s = summary()
+    assert s["total"] == 1200, s      # was 1000 before the fix
+    assert s["passed"] == 1200
+    assert s["failed"] == 0
+    assert len(get_results()) == 1000  # ring still caps, as documented
+
+
+def test_run_summary_exact_beyond_ring_buffer():
+    @verify(lambda result, ctx: ctx["i"] % 10 != 0, mode=Mode.SILENT)
+    def mostly_ok(i):
+        return i
+
+    with run("bulk") as rid:
+        for i in range(1200):
+            mostly_ok(i)
+    s = summary(run_id=rid)
+    assert s["total"] == 1200
+    # i = 0, 10, ..., 1190 -> 120 failures
+    assert s["failed"] == 120
+    assert s["passed"] == 1080
+
+
+def test_failures_accessor():
+    @verify(lambda result, ctx: result > 0, mode=Mode.SILENT)
+    def f(n):
+        return n
+
+    f(1); f(-1); f(2); f(-2)
+    fl = failures()
+    assert [r.result for r in fl] == [-1, -2]
+    assert all(not r.passed for r in fl)
+
+    with run("r") as rid:
+        f(-3)
+    assert [r.result for r in failures(run_id=rid)] == [-3]

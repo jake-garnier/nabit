@@ -111,6 +111,12 @@ _RESULTS: list[VerificationResult] = []
 _MAX_RESULTS = 1000
 _SINKS: list[Callable[[VerificationResult], None]] = []
 
+# Lifetime counters. The in-memory ring buffer caps at _MAX_RESULTS, so counts
+# derived from it go wrong on bulk workloads (a retro-audit of 24k rows reported
+# total=1000). summary() reads these instead — exact regardless of the ring.
+_TOTALS = {"total": 0, "passed": 0, "failed": 0}
+_RUN_TOTALS: dict[str, dict[str, int]] = {}
+
 
 def add_sink(fn: Callable[[VerificationResult], None]) -> None:
     """Register a callback invoked with every VerificationResult as it happens.
@@ -125,27 +131,48 @@ def clear_sinks() -> None:
 
 def get_results(run_id: Optional[str] = None) -> list[VerificationResult]:
     """Return recorded verification results (most recent last). Optionally
-    filter to a single run id."""
+    filter to a single run id.
+
+    Note: this is the recent ring buffer (last ~1000 results). For bulk work
+    the exact totals live in summary(), and every result is available to
+    sinks as it happens.
+    """
     if run_id is None:
         return list(_RESULTS)
     return [r for r in _RESULTS if r.run_id == run_id]
 
 
+def failures(run_id: Optional[str] = None) -> list[VerificationResult]:
+    """Recent FAILED verification results (most recent last). Convenience for
+    "show me what lied". Ring-buffer-backed, so this is recent failures, not
+    all-time — attach a sink if you need every failure durably."""
+    return [r for r in get_results(run_id) if not r.passed]
+
+
 def clear_results() -> None:
     """Clear the in-memory results log (useful between tests)."""
     _RESULTS.clear()
+    _TOTALS.clear()
+    _TOTALS.update({"total": 0, "passed": 0, "failed": 0})
+    _RUN_TOTALS.clear()
 
 
 def summary(run_id: Optional[str] = None) -> dict:
-    """Aggregate pass/fail stats, optionally scoped to one run id."""
+    """Aggregate pass/fail stats, optionally scoped to one run id.
+
+    Counts come from lifetime counters, so they stay exact even after the
+    in-memory ring buffer has rolled over on bulk workloads. The `failures`
+    name list comes from the recent ring buffer only.
+    """
+    counts = _RUN_TOTALS.get(run_id) if run_id is not None else _TOTALS
+    if counts is None:  # unknown run id — nothing was recorded under it
+        counts = {"total": 0, "passed": 0, "failed": 0}
+    total, passed = counts["total"], counts["passed"]
     rs = get_results(run_id)
-    total = len(rs)
-    passed = sum(1 for r in rs if r.passed)
-    failed = total - passed
     return {
         "total": total,
         "passed": passed,
-        "failed": failed,
+        "failed": counts["failed"],
         "pass_rate": (passed / total) if total else 1.0,
         "failures": [r.name for r in rs if not r.passed],
     }
@@ -155,6 +182,16 @@ def _record(result: VerificationResult) -> None:
     _RESULTS.append(result)
     if len(_RESULTS) > _MAX_RESULTS:
         del _RESULTS[0]
+
+    _TOTALS["total"] += 1
+    _TOTALS["passed" if result.passed else "failed"] += 1
+    if result.run_id is not None:
+        rt = _RUN_TOTALS.setdefault(
+            result.run_id, {"total": 0, "passed": 0, "failed": 0}
+        )
+        rt["total"] += 1
+        rt["passed" if result.passed else "failed"] += 1
+
     for sink in _SINKS:
         try:
             sink(result)
