@@ -1,5 +1,9 @@
 # nabit — *nab your agent's silent failures*
 
+[![PyPI version](https://img.shields.io/pypi/v/nabit)](https://pypi.org/project/nabit/)
+[![Python](https://img.shields.io/pypi/pyversions/nabit)](https://pypi.org/project/nabit/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 Your LLM agent said it created the customer. Your database says otherwise. You
 found out three days later from a support ticket.
 
