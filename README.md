@@ -53,6 +53,22 @@ reality.
 pip install nabit
 ```
 
+## The dashboard
+
+Turn any JSONL sink file into a **self-contained HTML dashboard** — inline
+CSS/JS, no server, no account, works offline, data never leaves your machine:
+
+```bash
+python -m nabit dashboard audit.jsonl                  # writes + opens browser
+python -m nabit dashboard captions.jsonl hackbot.jsonl # merge sources
+python -m nabit report audit.jsonl                     # terminal table
+```
+
+Summary cards, per-check pass/fail table, text search, source/run/status
+filters, and expandable drill-downs showing each lying claim's payload and
+error. This is the tool that was used to browse a 29k-verification production
+audit across two systems (a content pipeline and a recon platform).
+
 ## Usage
 
 ### Post-conditions check reality, not the agent's word
