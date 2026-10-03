@@ -40,7 +40,8 @@ from .core import (
 )
 from .sinks import jsonl_sink
 from .report import report, report_from_jsonl
-from .runner import audit, run_audit, run_named, load_audits, get_audits
+from .runner import (audit, run_audit, run_named, load_audits, get_audits,
+                     run_mode, load_schedules, set_enabled, is_enabled)
 
 from . import checks
 
@@ -65,8 +66,12 @@ __all__ = [
     "run_named",
     "load_audits",
     "get_audits",
+    "run_mode",
+    "load_schedules",
+    "set_enabled",
+    "is_enabled",
     "checks",
     "Mode",
 ]
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"

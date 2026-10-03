@@ -113,17 +113,22 @@ def _latest_run_file(history_dir: str | Path) -> Optional[str]:
 
 def build_html(records: list[dict], title: str = "nabit — verification dashboard",
                generated: Optional[str] = None,
-               history: Optional[list[dict]] = None) -> str:
+               history: Optional[list[dict]] = None,
+               schedules: Optional[dict] = None,
+               served: bool = False) -> str:
     """Render the self-contained dashboard. All dynamic behavior (search,
-    filters, drill-down) is vanilla JS over the embedded records. When
-    `history` (compact per-run aggregates from run_audit) is present the
-    dashboard adds a trend section; drill-down then covers the latest run."""
+    filters, drill-down) is vanilla JS over the embedded records. `history`
+    (per-run aggregates) adds the trend section; `schedules` adds the
+    schedules panel; `served=True` enables the live toggle/run-now buttons
+    (only meaningful under `python -m nabit serve`)."""
     data = {
         "title": title,
         "generated": generated or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "records": records,
         "aggregate": aggregate(records),
         "history": history or [],
+        "schedules": schedules or {},
+        "served": served,
     }
     payload = json.dumps(data, default=str).replace("</", "<\\/")  # </script> safety
     return _TEMPLATE.replace("__DATA__", payload).replace("__TITLE__", _escape(title))
@@ -133,17 +138,23 @@ def _escape(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def write_dashboard(paths: list[str], out: str, title: str = "nabit — verification dashboard",
-                    max_records: int = DEFAULT_MAX_RECORDS) -> str:
-    """Build the dashboard from JSONL files and/or history directories (as
-    produced by `python -m nabit run`). A directory adds the trend view and
-    contributes its latest run's records for drill-down."""
+def gather_inputs(paths: list[str], max_records: int = DEFAULT_MAX_RECORDS,
+                  include_schedules: bool = True):
+    """Resolve a mix of JSONL files and history directories into
+    (records, history, schedules). Records from a history dir come from its
+    latest run file, labeled by the dir (audit) name."""
+    from .runner import load_schedules
+
     files: list[str] = []
     history: list[dict] = []
+    schedules: dict = {}
     sources: dict = {}
     for p in paths:
         if Path(p).is_dir():
             history.extend(load_history(p))
+            if include_schedules:
+                for name, entry in load_schedules(p).items():
+                    schedules[name] = dict(entry, history_dir=str(p))
             latest = _latest_run_file(p)
             if latest:
                 files.append(latest)
@@ -151,9 +162,18 @@ def write_dashboard(paths: list[str], out: str, title: str = "nabit — verifica
         else:
             files.append(p)
     records = load_records(files, max_records, sources=sources)
+    return records, history, schedules
+
+
+def write_dashboard(paths: list[str], out: str, title: str = "nabit — verification dashboard",
+                    max_records: int = DEFAULT_MAX_RECORDS) -> str:
+    """Build the dashboard from JSONL files and/or history directories (as
+    produced by `python -m nabit run`). A directory adds the trend view and
+    contributes its latest run's records for drill-down."""
+    records, history, schedules = gather_inputs(paths, max_records)
     if not records and not history:
         raise SystemExit("no verification records found in: %s" % ", ".join(paths))
-    html = build_html(records, title=title, history=history)
+    html = build_html(records, title=title, history=history, schedules=schedules)
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)
     return out
@@ -238,6 +258,13 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <h1><span class="g">nabit</span> // verification dashboard</h1>
   <div class="sub" id="meta"></div>
   <div class="cards" id="cards"></div>
+
+  <div id="schedwrap" style="display:none">
+    <div class="section"><span class="g">$</span> schedules <span id="schedmeta"></span></div>
+    <table><thead><tr>
+      <th>audit</th><th>cadence</th><th>last run</th><th>backfill</th><th>last result</th><th>status</th><th>controls</th>
+    </tr></thead><tbody id="schedbody"></tbody></table>
+  </div>
 
   <div id="historywrap" style="display:none">
     <div class="section"><span class="g">$</span> history — scheduled runs over time <span id="histmeta"></span></div>
@@ -473,6 +500,78 @@ function renderHistory() {
 
 render();
 renderHistory();
+
+// --- schedules panel (from schedules.json; controls live only under serve) ---
+function humanCron(c) {
+  if (!c) return 'manual';
+  const p = String(c).trim().split(/\s+/);
+  if (p.length !== 5) return esc(c);
+  const [m, h] = p;
+  if (m.startsWith('*/')) return 'every ' + m.slice(2) + ' min';
+  if (h === '*') return 'hourly at :' + String(m).padStart(2, '0');
+  return 'daily at ' + String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+function fmtAgo(ts) {
+  if (!ts) return 'never';
+  const s = Math.floor(Date.now() / 1000 - ts);
+  if (s < 90) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+function renderSchedules() {
+  const S = DATA.schedules || {};
+  const names = Object.keys(S);
+  if (!names.length) return;
+  $('#schedwrap').style.display = '';
+  $('#schedmeta').textContent = DATA.served
+    ? '(live — toggles apply to real runs)'
+    : '(static copy — run `python -m nabit serve` for live controls)';
+  $('#schedbody').innerHTML = names.sort().map(n => {
+    const e = S[n];
+    const enabled = e.enabled !== false;
+    const status = enabled
+      ? '<span class="pass">● enabled</span>'
+      : '<span class="fail">○ disabled</span>';
+    const backfill = e.last_backfill_ts
+      ? `<span class="pass">✓ ${fmtAgo(e.last_backfill_ts)}</span>` +
+        (e.last_backfill_failed ? ` <span class="fail">(${e.last_backfill_failed} historical)</span>` : '')
+      : '<span style="color:var(--dim)">not run</span>';
+    const lastRun = e.last_ts ? fmtAgo(e.last_ts) : '<span style="color:var(--dim)">—</span>';
+    const lastResult = e.last_ts
+      ? `<span class="${e.last_failed ? 'fail' : 'pass'}">${e.last_failed || 0}/${e.last_total || '?'} failed</span>`
+      : '<span style="color:var(--dim)">—</span>';
+    const controls = DATA.served
+      ? `<button class="mini" onclick="api('toggle','${esc(n)}')">${enabled ? 'disable' : 'enable'}</button> ` +
+        `<button class="mini" onclick="api('run','${esc(n)}')">run now</button>`
+      : '<span style="color:var(--dim)">—</span>';
+    return `<tr>
+      <td><span class="nm">${esc(n)}</span></td>
+      <td>${humanCron(e.cron)}</td>
+      <td>${lastRun}</td>
+      <td>${backfill}</td>
+      <td>${lastResult}</td>
+      <td>${status}</td>
+      <td>${controls}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function api(action, auditName) {
+  try {
+    const r = await fetch('/api/' + action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audit: auditName }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    location.reload();
+  } catch (err) { alert('nabit serve: ' + err.message); }
+}
+
+renderSchedules();
 </script>
 </body>
 </html>
@@ -500,6 +599,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_run = sub.add_parser("run", help="run a registered audit and record history (cron-friendly)")
     p_run.add_argument("name", nargs="?", help="audit name (as defined by @nabit.audit)")
     p_run.add_argument("--all", action="store_true", help="run every audit in the audits file")
+    p_run.add_argument("--backfill", action="store_true",
+                       help="run in backfill mode: audits widen to the full historical "
+                            "census (use once at setup; becomes the first trend point)")
     p_run.add_argument("--audits", default=None,
                        help="path to the audits module (default: $NABIT_AUDITS or ./nabit_audits.py)")
     p_run.add_argument("--out", default="nabit-history", help="history directory (default: nabit-history/)")
@@ -508,42 +610,72 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_ls = sub.add_parser("audits", help="list audits defined in an audits module")
     p_ls.add_argument("--audits", default=None)
 
+    p_cron = sub.add_parser("crontab", help="print crontab lines for audits with schedule metadata")
+    p_cron.add_argument("--audits", default=None)
+    p_cron.add_argument("--out", default="nabit-history")
+
+    p_serve = sub.add_parser("serve", help="serve the dashboard locally with live schedule controls")
+    p_serve.add_argument("paths", nargs="+", help="JSONL files and/or history directories")
+    p_serve.add_argument("--port", type=int, default=8642)
+    p_serve.add_argument("--audits", default=None, help="audits module (enables the run-now button)")
+    p_serve.add_argument("--title", default="nabit — verification dashboard")
+    p_serve.add_argument("--no-browser", action="store_true")
+
     args = parser.parse_args(argv)
     if args.cmd == "report":
         print(report_from_jsonl(args.file))
         return
 
-    if args.cmd in ("run", "audits"):
-        import os as _os
+    import os as _os
 
-        audits_path = (args.audits if getattr(args, "audits", None)
-                       else _os.environ.get("NABIT_AUDITS") or "nabit_audits.py")
-        from .runner import load_audits, run_audit
+    audits_path = None
+    if getattr(args, "audits", None):
+        audits_path = args.audits
+    elif args.cmd in ("run", "audits", "crontab"):
+        audits_path = _os.environ.get("NABIT_AUDITS") or "nabit_audits.py"
+
+    if args.cmd in ("run", "audits", "crontab"):
+        from .runner import crontab_lines, load_audits, run_audit
 
         audits = load_audits(audits_path)
         if args.cmd == "audits":
             for n in sorted(audits):
-                print(n, "-", (audits[n].__doc__ or "").strip().splitlines()[0]
-                      if audits[n].__doc__ else "")
+                sched = getattr(audits[n], "_nabit_schedule", None)
+                mark = f"  [cron: {sched}]" if sched else ""
+                doc = (audits[n].__doc__ or "").strip().splitlines()[0] if audits[n].__doc__ else ""
+                print(f"{n}{mark}  {doc}")
             if not audits:
                 print("no @nabit.audit functions found in", audits_path)
+            return
+        if args.cmd == "crontab":
+            lines = crontab_lines(audits, audits_path, args.out)
+            print("\n".join(lines) if lines else
+                  f"no audits with @audit(schedule=...) found in {audits_path}")
             return
         names = sorted(audits) if args.all else [args.name]
         if not args.all and not args.name:
             parser.error("run needs an audit name (or --all)")
+        mode = "backfill" if args.backfill else "scheduled"
         any_failed = 0
         for n in names:
             if n not in audits:
                 parser.error(f"unknown audit {n!r}; available: {', '.join(sorted(audits)) or 'none'}")
-            res = run_audit(audits[n], history_dir=args.out)
-            print(f"== {n}: {res['passed']}/{res['total']} passed, "
+            res = run_audit(audits[n], history_dir=args.out, mode=mode,
+                            skip_if_disabled=True)
+            if res is None:
+                print(f"== {n}: skipped (disabled in dashboard)")
+                continue
+            label = "backfill" if mode else "run"
+            print(f"== {n} [{label}]: {res['passed']}/{res['total']} passed, "
                   f"{res['failed']} failed ({res['duration_s']}s) -> {res['run_file']}")
-            from .report import report_from_jsonl as _rfj
-
-            print(_rfj(res["run_file"]))
+            print(report_from_jsonl(res["run_file"]))
             any_failed += res["failed"]
         if args.strict and any_failed:
             sys.exit(1)
+        return
+
+    if args.cmd == "serve":
+        _serve(args)
         return
 
     out = write_dashboard(args.files, args.out, title=args.title,
@@ -557,6 +689,96 @@ def main(argv: Optional[list[str]] = None) -> None:
         import webbrowser
 
         webbrowser.open("file://" + str(Path(out).resolve()))
+
+
+def _serve(args) -> None:
+    """Local UI server: serves the live dashboard and the schedule-control
+    API. Stdlib only. Bound to localhost by default — this is a convenience
+    for one operator, not a network service."""
+    import json as _json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse
+
+    from .runner import load_audits, load_schedules, run_audit, set_enabled
+
+    audits = load_audits(args.audits) if args.audits else {}
+    state = {"paths": args.paths, "title": args.title}
+
+    def _page() -> bytes:
+        records, history, schedules = gather_inputs(state["paths"])
+        html = build_html(records, title=state["title"], history=history,
+                          schedules=schedules, served=True)
+        return html.encode("utf-8")
+
+    def _dir_for(audit_name: str) -> Optional[str]:
+        for p in state["paths"]:
+            if Path(p).is_dir() and audit_name in load_schedules(p):
+                return p
+        dirs = [p for p in state["paths"] if Path(p).is_dir()]
+        return dirs[0] if dirs else None
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype="text/html; charset=utf-8"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if urlparse(self.path).path in ("/", "/index.html"):
+                try:
+                    self._send(200, _page())
+                except Exception as e:  # noqa: BLE001
+                    self._send(500, str(e).encode(), "text/plain")
+            else:
+                self._send(404, b"not found", "text/plain")
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            if path not in ("/api/toggle", "/api/run"):
+                self._send(404, b"not found", "text/plain")
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = _json.loads(self.rfile.read(length) or b"{}")
+                name = body.get("audit")
+                if not name:
+                    raise ValueError("missing 'audit'")
+                if path == "/api/toggle":
+                    hdir = _dir_for(name)
+                    if not hdir:
+                        raise ValueError(f"no history dir tracks {name!r}")
+                    entry = set_enabled(hdir, name, not is_enabled_now(hdir, name))
+                    resp = {"audit": name, "enabled": entry.get("enabled", True)}
+                else:  # /api/run
+                    if name not in audits:
+                        raise ValueError(f"unknown audit {name!r} (pass --audits)")
+                    hdir = _dir_for(name) or "nabit-history"
+                    res = run_audit(audits[name], history_dir=hdir, skip_if_disabled=True)
+                    if res is None:
+                        resp = {"audit": name, "skipped": "disabled"}
+                    else:
+                        resp = {"audit": name, "passed": res["passed"],
+                                "total": res["total"], "failed": res["failed"]}
+                self._send(200, _json.dumps(resp).encode(), "application/json")
+            except Exception as e:  # noqa: BLE001
+                self._send(400, _json.dumps({"error": str(e)}).encode(),
+                           "application/json")
+
+        def log_message(self, fmt, *a):  # quiet
+            pass
+
+    def is_enabled_now(hdir, name):
+        return load_schedules(hdir).get(name, {}).get("enabled", True)
+
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"nabit serve: {url}  (ctrl-C to stop)")
+    if not args.no_browser:
+        import webbrowser
+
+        webbrowser.open(url)
+    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
