@@ -665,7 +665,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             if res is None:
                 print(f"== {n}: skipped (disabled in dashboard)")
                 continue
-            label = "backfill" if mode else "run"
+            label = mode
             print(f"== {n} [{label}]: {res['passed']}/{res['total']} passed, "
                   f"{res['failed']} failed ({res['duration_s']}s) -> {res['run_file']}")
             print(report_from_jsonl(res["run_file"]))
