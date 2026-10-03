@@ -548,8 +548,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     out = write_dashboard(args.files, args.out, title=args.title,
                           max_records=args.max_records)
-    n = len(load_records(args.files, args.max_records))
-    print(f"wrote {out} ({n} verifications)")
+    file_paths = [p if not Path(p).is_dir() else (_latest_run_file(p) or "")
+                  for p in args.files]
+    n = len(load_records([f for f in file_paths if f]))
+    n_hist = sum(len(load_history(p)) for p in args.files if Path(p).is_dir())
+    print(f"wrote {out} ({n} verifications" + (f", {n_hist} history runs" if n_hist else "") + ")")
     if not args.no_open:
         import webbrowser
 
